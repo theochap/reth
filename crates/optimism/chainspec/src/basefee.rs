@@ -1,25 +1,10 @@
 //! Base fee related utilities for Optimism chains.
 
 use alloy_consensus::BlockHeader;
+use alloy_eips::calc_next_block_base_fee;
 use op_alloy_consensus::{decode_holocene_extra_data, decode_jovian_extra_data, EIP1559ParamError};
 use reth_chainspec::{BaseFeeParams, EthChainSpec};
 use reth_optimism_forks::OpHardforks;
-
-fn next_base_fee_params<H: BlockHeader>(
-    chain_spec: impl EthChainSpec + OpHardforks,
-    parent: &H,
-    timestamp: u64,
-    denominator: u32,
-    elasticity: u32,
-) -> u64 {
-    let base_fee_params = if elasticity == 0 && denominator == 0 {
-        chain_spec.base_fee_params_at_timestamp(timestamp)
-    } else {
-        BaseFeeParams::new(denominator as u128, elasticity as u128)
-    };
-
-    parent.next_block_base_fee(base_fee_params).unwrap_or_default()
-}
 
 /// Extracts the Holocene 1599 parameters from the encoded extra data from the parent header.
 ///
@@ -36,7 +21,13 @@ where
 {
     let (elasticity, denominator) = decode_holocene_extra_data(parent.extra_data())?;
 
-    Ok(next_base_fee_params(chain_spec, parent, timestamp, denominator, elasticity))
+    let base_fee_params = if elasticity == 0 && denominator == 0 {
+        chain_spec.base_fee_params_at_timestamp(timestamp)
+    } else {
+        BaseFeeParams::new(denominator as u128, elasticity as u128)
+    };
+
+    Ok(parent.next_block_base_fee(base_fee_params).unwrap_or_default())
 }
 
 /// Extracts the Jovian 1599 parameters from the encoded extra data from the parent header.
@@ -57,8 +48,26 @@ where
 {
     let (elasticity, denominator, min_base_fee) = decode_jovian_extra_data(parent.extra_data())?;
 
-    let next_base_fee =
-        next_base_fee_params(chain_spec, parent, timestamp, denominator, elasticity);
+    let base_fee_params = if elasticity == 0 && denominator == 0 {
+        chain_spec.base_fee_params_at_timestamp(timestamp)
+    } else {
+        BaseFeeParams::new(denominator as u128, elasticity as u128)
+    };
+
+    // Starting from Jovian, we use the maximum of the gas used and the blob gas used to calculate
+    // the next base fee.
+    let gas_used = if parent.blob_gas_used().unwrap_or_default() > parent.gas_used() {
+        parent.blob_gas_used().unwrap_or_default()
+    } else {
+        parent.gas_used()
+    };
+
+    let next_base_fee = calc_next_block_base_fee(
+        gas_used,
+        parent.gas_limit(),
+        parent.base_fee_per_gas().unwrap_or_default(),
+        base_fee_params,
+    );
 
     if next_base_fee < min_base_fee {
         return Ok(min_base_fee);
